@@ -13,11 +13,11 @@ notify_and_verify() {
     # Send notification
     result=$(ssh -o ConnectTimeout=5 -o BatchMode=yes "$VM_USER@$VM_HOST" \
         "/usr/local/bin/usb-event-handler $EVENT $BUSID $(hostname)" 2>/dev/null)
-
+    
     if [ "$result" != "OK" ]; then
         return 1
     fi
-
+    
     # For connect/boot, verify device is actually attached
     if [ "$EVENT" = "connect" ] || [ "$EVENT" = "boot" ]; then
         sleep 1

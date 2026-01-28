@@ -221,7 +221,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         attached.add(m.group(1))
         except: pass
         return attached
-
+    
     def get_device_info(self, busid):
         """Read device info from sysfs"""
         info = {}
