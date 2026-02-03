@@ -385,6 +385,50 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             return False, str(e)
 
+    def switch_to_flash_mode(self, tty):
+        """Switch to esp_rfc2217_server for fast flashing (no logging)"""
+        # Stop current server
+        self.stop_server(tty)
+        time.sleep(0.5)
+
+        # Get port assignment
+        config = self.read_config()
+        port = self.assign_port(tty, config)
+
+        # Find esp_rfc2217_server
+        server_paths = [
+            '/usr/local/bin/esp_rfc2217_server.py',
+            '/usr/local/bin/esp_rfc2217_server',
+            os.path.expanduser('~/.local/bin/esp_rfc2217_server.py'),
+        ]
+        server_cmd = None
+        for path in server_paths:
+            if os.path.exists(path):
+                server_cmd = path
+                break
+
+        if not server_cmd:
+            return False, "esp_rfc2217_server not found"
+
+        try:
+            subprocess.Popen(
+                [server_cmd, '-p', str(port), tty],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True)
+            time.sleep(0.5)
+            return True, f"Flash mode on port {port} (no logging, faster)"
+        except Exception as e:
+            return False, str(e)
+
+    def switch_to_log_mode(self, tty):
+        """Switch back to serial-proxy for logging"""
+        # Stop current server
+        self.stop_server(tty)
+        time.sleep(0.5)
+
+        # Start serial-proxy
+        return self.start_server(tty)
+
     def get_devices(self):
         """Get all devices with their status"""
         devices = self.get_serial_devices()
@@ -501,6 +545,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 ok, msg = self.stop_server(tty)
                 results.append(f"{tty}: {msg}")
             self.send_json({'success': True, 'messages': results})
+
+        elif path == '/api/flash-mode':
+            # Switch to esp_rfc2217_server for fast flashing (no logging)
+            tty = body.get('tty', '')
+            if not tty:
+                self.send_json({'success': False, 'error': 'Missing tty'})
+                return
+            ok, msg = self.switch_to_flash_mode(tty)
+            self.send_json({'success': ok, 'message': msg})
+
+        elif path == '/api/log-mode':
+            # Switch back to serial-proxy for logging
+            tty = body.get('tty', '')
+            if not tty:
+                self.send_json({'success': False, 'error': 'Missing tty'})
+                return
+            ok, msg = self.switch_to_log_mode(tty)
+            self.send_json({'success': ok, 'message': msg})
 
         else:
             self.send_json({'error': 'Not found'}, 404)
