@@ -8,10 +8,13 @@ import socket
 import os
 import re
 import socketserver
+import signal
 from urllib.parse import urlparse
 
 PORT = 8080
 CONFIG_FILE = "/etc/usbip/vm.conf"
+DEVICES_CONFIG = "/etc/usbip/devices.conf"
+RFC2217_BASE_PORT = 4000  # First RFC2217 port, increments per device
 
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html>
@@ -37,10 +40,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         button.success { background: #28a745; }
         .log { background: #1e1e1e; color: #0f0; padding: 15px; border-radius: 4px;
                font-family: monospace; font-size: 13px; max-height: 200px; overflow-y: auto; }
-        .device { display: flex; justify-content: space-between; align-items: center;
-                 padding: 10px; background: #f8f9fa; margin: 5px 0; border-radius: 4px; }
+        .device { padding: 10px; background: #f8f9fa; margin: 5px 0; border-radius: 4px; }
         .device.attached { border-left: 4px solid #28a745; }
         .device.bound { border-left: 4px solid #ffc107; }
+        .device.rfc2217 { border-left: 4px solid #17a2b8; }
+        .device-header { display: flex; justify-content: space-between; align-items: center; }
+        .device-controls { margin-top: 8px; display: flex; gap: 10px; align-items: center; }
+        .mode-select { padding: 5px; border-radius: 4px; border: 1px solid #ddd; }
+        .mode-badge { font-size: 11px; padding: 2px 6px; border-radius: 3px; }
+        .mode-badge.usbip { background: #ffc107; color: #000; }
+        .mode-badge.rfc2217 { background: #17a2b8; color: #fff; }
+        .port-info { font-size: 12px; color: #666; }
         .vm-option { padding: 10px; margin: 5px 0; background: #f8f9fa; border-radius: 4px;
                     cursor: pointer; border: 2px solid transparent; }
         .vm-option:hover { border-color: #007bff; }
@@ -110,11 +120,35 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 el.innerHTML = devices.map(d => {
                     let info = d.product || d.name;
                     if (d.serial) info += ' <small style="color:#666">[' + d.serial + ']</small>';
-                    return '<div class="device ' + (d.attached ? 'attached' : 'bound') + '">' +
+                    const mode = d.mode || 'usbip';
+                    const modeClass = mode === 'rfc2217' ? 'rfc2217' : (d.attached ? 'attached' : 'bound');
+                    let status = '';
+                    if (mode === 'rfc2217') {
+                        status = d.rfc2217_active ?
+                            '<span class="mode-badge rfc2217">RFC2217 :' + d.rfc2217_port + '</span>' :
+                            '<span class="mode-badge rfc2217">RFC2217 stopped</span>';
+                    } else {
+                        status = d.attached ? '&#10003; attached' : '&#9679; bound';
+                    }
+                    return '<div class="device ' + modeClass + '">' +
+                        '<div class="device-header">' +
                         '<div><strong>' + d.busid + '</strong>: ' + info + '</div>' +
-                        '<div>' + (d.attached ? '&#10003; attached' : '&#9679; bound') + '</div></div>';
+                        '<div>' + status + '</div></div>' +
+                        '<div class="device-controls">' +
+                        '<select class="mode-select" onchange="setMode(\\'' + d.busid + '\\', this.value)">' +
+                        '<option value="usbip"' + (mode==='usbip' ? ' selected' : '') + '>USB/IP</option>' +
+                        '<option value="rfc2217"' + (mode==='rfc2217' ? ' selected' : '') + '>RFC2217</option>' +
+                        '</select>' +
+                        (mode === 'rfc2217' ? '<span class="port-info">Port: ' + (d.rfc2217_port || '?') + '</span>' : '') +
+                        '</div></div>';
                 }).join('');
             } else { el.innerHTML = '<p>No serial devices</p>'; }
+        }
+        async function setMode(busid, mode) {
+            log('Setting ' + busid + ' to ' + mode + ' mode...');
+            const data = await api('set-mode', 'POST', { busid, mode });
+            log(data.message || data.error);
+            loadDevices();
         }
         async function loadVms() {
             const data = await api('scan');
@@ -203,6 +237,129 @@ class Handler(http.server.BaseHTTPRequestHandler):
         os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
         with open(CONFIG_FILE, 'w') as f:
             f.write(f"VM_HOST={host}\nVM_USER={user}\n")
+
+    def read_devices_config(self):
+        """Read per-device mode config: {busid: {mode: 'usbip'|'rfc2217', port: int}}"""
+        config = {}
+        if os.path.exists(DEVICES_CONFIG):
+            with open(DEVICES_CONFIG) as f:
+                for line in f:
+                    if '=' in line and not line.strip().startswith('#'):
+                        busid, rest = line.strip().split('=', 1)
+                        parts = rest.split(',')
+                        mode = parts[0] if parts else 'usbip'
+                        port = int(parts[1]) if len(parts) > 1 else None
+                        config[busid] = {'mode': mode, 'port': port}
+        return config
+
+    def write_devices_config(self, config):
+        """Write per-device mode config"""
+        os.makedirs(os.path.dirname(DEVICES_CONFIG), exist_ok=True)
+        with open(DEVICES_CONFIG, 'w') as f:
+            f.write("# Device mode config: busid=mode,port\n")
+            for busid, data in config.items():
+                port = data.get('port', '')
+                f.write(f"{busid}={data['mode']},{port}\n")
+
+    def get_next_rfc2217_port(self, config):
+        """Get next available RFC2217 port"""
+        used_ports = {d.get('port') for d in config.values() if d.get('port')}
+        port = RFC2217_BASE_PORT
+        while port in used_ports:
+            port += 1
+        return port
+
+    def get_tty_for_busid(self, busid):
+        """Find /dev/ttyUSB* for a busid"""
+        try:
+            # Look in sysfs for the tty
+            sysfs = f"/sys/bus/usb/devices/{busid}"
+            for root, dirs, files in os.walk(sysfs):
+                if 'tty' in dirs:
+                    tty_dir = os.path.join(root, 'tty')
+                    ttys = os.listdir(tty_dir)
+                    if ttys:
+                        return f"/dev/{ttys[0]}"
+            # Fallback: check all ttyUSB devices
+            for tty in os.listdir('/dev'):
+                if tty.startswith('ttyUSB') or tty.startswith('ttyACM'):
+                    return f"/dev/{tty}"
+        except: pass
+        return None
+
+    def get_rfc2217_pids(self):
+        """Get running esp_rfc2217_server processes: {port: pid}"""
+        pids = {}
+        try:
+            result = subprocess.run(['pgrep', '-a', '-f', 'esp_rfc2217_server'],
+                capture_output=True, text=True)
+            for line in result.stdout.strip().split('\n'):
+                if line:
+                    parts = line.split()
+                    pid = int(parts[0])
+                    # Find port in args
+                    for i, arg in enumerate(parts):
+                        if arg == '-p' and i+1 < len(parts):
+                            try:
+                                port = int(parts[i+1])
+                                pids[port] = pid
+                            except: pass
+        except: pass
+        return pids
+
+    def start_rfc2217(self, busid, port):
+        """Start RFC2217 server for device"""
+        tty = self.get_tty_for_busid(busid)
+        if not tty:
+            return False, f"No tty found for {busid}"
+
+        # First unbind from usbip
+        subprocess.run(['/usr/sbin/usbip', 'unbind', '-b', busid],
+            capture_output=True, timeout=10)
+
+        # Start esp_rfc2217_server
+        try:
+            proc = subprocess.Popen(
+                ['esp_rfc2217_server.py', '-p', str(port), tty],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True)
+            return True, f"Started RFC2217 on port {port} for {tty}"
+        except Exception as e:
+            return False, str(e)
+
+    def stop_rfc2217(self, port):
+        """Stop RFC2217 server on port"""
+        pids = self.get_rfc2217_pids()
+        if port in pids:
+            try:
+                os.kill(pids[port], signal.SIGTERM)
+                return True, f"Stopped RFC2217 on port {port}"
+            except Exception as e:
+                return False, str(e)
+        return True, "Not running"
+
+    def set_device_mode(self, busid, mode):
+        """Set device mode and start/stop appropriate service"""
+        config = self.read_devices_config()
+        old_mode = config.get(busid, {}).get('mode', 'usbip')
+        old_port = config.get(busid, {}).get('port')
+
+        if mode == 'rfc2217':
+            # Stop usbip, start RFC2217
+            port = old_port or self.get_next_rfc2217_port(config)
+            config[busid] = {'mode': 'rfc2217', 'port': port}
+            self.write_devices_config(config)
+            ok, msg = self.start_rfc2217(busid, port)
+            return ok, msg
+        else:
+            # Stop RFC2217 if running, bind to usbip
+            if old_port:
+                self.stop_rfc2217(old_port)
+            config[busid] = {'mode': 'usbip', 'port': None}
+            self.write_devices_config(config)
+            subprocess.run(['/usr/sbin/usbip', 'bind', '-b', busid],
+                capture_output=True, timeout=10)
+            return True, f"Set {busid} to USB/IP mode"
     
     def get_vm_attached(self):
         """Get busids attached on VM"""
@@ -235,7 +392,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def get_devices(self):
         devices = []
+        seen_busids = set()
         attached = self.get_vm_attached()
+        dev_config = self.read_devices_config()
+        rfc2217_pids = self.get_rfc2217_pids()
+
+        # Get devices from usbip list
         try:
             result = subprocess.run(['/usr/sbin/usbip', 'list', '-l'], capture_output=True, text=True)
             current_busid = None
@@ -247,16 +409,43 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     name = line.strip()
                     skipped = 'ethernet' in name.lower()
                     info = self.get_device_info(current_busid)
+                    mode_info = dev_config.get(current_busid, {'mode': 'usbip'})
+                    mode = mode_info.get('mode', 'usbip')
+                    port = mode_info.get('port')
                     devices.append({
                         'busid': current_busid,
                         'name': name,
                         'product': info.get('product', ''),
                         'serial': info.get('serial', ''),
                         'skipped': skipped,
-                        'attached': current_busid in attached
+                        'attached': current_busid in attached,
+                        'mode': mode,
+                        'rfc2217_port': port,
+                        'rfc2217_active': port in rfc2217_pids if port else False
                     })
+                    seen_busids.add(current_busid)
                     current_busid = None
         except: pass
+
+        # Also check devices in RFC2217 mode (not shown by usbip list)
+        for busid, mode_info in dev_config.items():
+            if busid not in seen_busids and mode_info.get('mode') == 'rfc2217':
+                info = self.get_device_info(busid)
+                port = mode_info.get('port')
+                # Check if device still exists
+                if os.path.exists(f"/sys/bus/usb/devices/{busid}"):
+                    devices.append({
+                        'busid': busid,
+                        'name': info.get('product', 'Serial Device'),
+                        'product': info.get('product', ''),
+                        'serial': info.get('serial', ''),
+                        'skipped': False,
+                        'attached': False,
+                        'mode': 'rfc2217',
+                        'rfc2217_port': port,
+                        'rfc2217_active': port in rfc2217_pids if port else False
+                    })
+
         return devices
     
     def scan_vms(self):
@@ -340,7 +529,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         content_len = int(self.headers.get('Content-Length', 0))
         body = json.loads(self.rfile.read(content_len)) if content_len else {}
         
-        if path == '/api/test':
+        if path == '/api/set-mode':
+            busid = body.get('busid', '')
+            mode = body.get('mode', 'usbip')
+            if not busid:
+                self.send_json({'success': False, 'error': 'Missing busid'})
+                return
+            ok, msg = self.set_device_mode(busid, mode)
+            self.send_json({'success': ok, 'message': msg if ok else None, 'error': msg if not ok else None})
+        elif path == '/api/test':
             ok, msg = self.test_connection(body.get('host', ''), body.get('user', 'dev'))
             self.send_json({'success': ok, 'message': f"{'OK' if ok else 'Failed'}: {msg}"})
         elif path == '/api/setup':
