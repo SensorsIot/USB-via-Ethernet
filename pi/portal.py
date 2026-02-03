@@ -460,15 +460,89 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             self.send_json({'error': 'Not found'}, 404)
 
+def get_serial_devices_standalone():
+    """Find all serial devices (standalone function)"""
+    devices = []
+    for pattern in ['/dev/ttyUSB*', '/dev/ttyACM*']:
+        for tty in glob.glob(pattern):
+            devices.append(tty)
+    return devices
+
+def start_server_standalone(tty, config_file=CONFIG_FILE):
+    """Start RFC2217 server for device (standalone function)"""
+    # Read config
+    config = {}
+    if os.path.exists(config_file):
+        try:
+            with open(config_file) as f:
+                for line in f:
+                    if '=' in line and not line.strip().startswith('#'):
+                        t, p = line.strip().split('=', 1)
+                        config[t] = int(p)
+        except: pass
+
+    # Assign port
+    if tty in config:
+        port = config[tty]
+    else:
+        used_ports = set(config.values())
+        port = RFC2217_BASE_PORT
+        while port in used_ports:
+            port += 1
+        config[tty] = port
+        # Save config
+        os.makedirs(os.path.dirname(config_file), exist_ok=True)
+        with open(config_file, 'w') as f:
+            f.write("# RFC2217 device-port assignments\n")
+            for t, p in sorted(config.items(), key=lambda x: x[1]):
+                f.write(f"{t}={p}\n")
+
+    # Check if already running
+    try:
+        result = subprocess.run(['pgrep', '-a', '-f', 'esp_rfc2217_server'],
+            capture_output=True, text=True)
+        if tty in result.stdout:
+            return True, f"Already running on port {port}"
+    except: pass
+
+    # Find server command
+    server_paths = [
+        '/usr/local/bin/esp_rfc2217_server',
+        '/usr/local/bin/esp_rfc2217_server.py',
+        os.path.expanduser('~/.local/bin/esp_rfc2217_server.py'),
+        '/usr/bin/esp_rfc2217_server.py'
+    ]
+    server_cmd = None
+    for path in server_paths:
+        if os.path.exists(path):
+            server_cmd = path
+            break
+    if not server_cmd:
+        try:
+            result = subprocess.run(['which', 'esp_rfc2217_server.py'],
+                capture_output=True, text=True)
+            if result.returncode == 0:
+                server_cmd = result.stdout.strip()
+        except: pass
+
+    if not server_cmd:
+        return False, "esp_rfc2217_server not found"
+
+    # Start server
+    try:
+        subprocess.Popen(
+            [server_cmd, '-p', str(port), tty],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        return True, f"Started on port {port}"
+    except Exception as e:
+        return False, str(e)
+
 def auto_start_all():
     """Start RFC2217 servers for all connected devices"""
-    handler = Handler(None, None, None)
-    handler.__class__ = Handler  # Allow method access without full init
-
-    devices = handler.get_serial_devices()
-    for d in devices:
-        tty = d['tty']
-        ok, msg = handler.start_server(tty)
+    devices = get_serial_devices_standalone()
+    for tty in devices:
+        ok, msg = start_server_standalone(tty)
         print(f"  {tty}: {msg}")
 
 if __name__ == '__main__':
