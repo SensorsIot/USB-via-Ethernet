@@ -4,6 +4,9 @@
 
 ```bash
 sudo apt update && sudo apt install usbip
+
+# Optional: For RFC2217 mode (serial-over-TCP alternative to USB/IP)
+pip3 install esptool
 ```
 
 ## Installation
