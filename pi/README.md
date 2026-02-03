@@ -6,7 +6,8 @@
 sudo apt update && sudo apt install usbip
 
 # Optional: For RFC2217 mode (serial-over-TCP alternative to USB/IP)
-pip3 install esptool
+# Must be system-wide since portal runs as root
+sudo pip3 install esptool --break-system-packages
 ```
 
 ## Installation

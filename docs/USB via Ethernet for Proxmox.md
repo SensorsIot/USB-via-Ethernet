@@ -2,7 +2,12 @@
 
 ## Overview
 
-This project enables USB serial devices (ESP32, Arduino, etc.) connected to a Raspberry Pi to be used by containers running on Proxmox VMs over the network. The solution uses the USB/IP protocol with a push-based architecture where the Pi controls all USB state.
+This project enables USB serial devices (ESP32, Arduino, etc.) connected to a Raspberry Pi to be used by containers running on Proxmox VMs over the network. The solution supports two modes:
+
+- **USB/IP**: Full USB device passthrough using kernel modules (supports any USB device)
+- **RFC2217**: Serial-over-TCP using esptool's RFC2217 server (simpler, ESP32-optimized)
+
+The Pi web portal allows per-device mode selection. USB/IP uses a push-based architecture where the Pi controls all USB state.
 
 ## Problem Statement
 
@@ -82,7 +87,8 @@ The Raspberry Pi is the **single source of truth** for USB state. This eliminate
 | `usbipd` | USB/IP daemon, exports devices on port 3240 |
 | `usbip-bind.sh` | Binds serial devices for export |
 | `notify-vm.sh` | Notifies VM of events, verifies attachment |
-| `usbip-portal` | Web UI for setup and status |
+| `usbip-portal` | Web UI for setup, status, and mode selection |
+| `esptool` | Provides esp_rfc2217_server for RFC2217 mode |
 | udev rules | Trigger on USB connect/disconnect |
 
 ### Proxmox VM
@@ -128,6 +134,7 @@ Containers with `/dev` mounted see the same device information.
 | 3240 | TCP | VM → Pi | USB/IP data |
 | 22 | TCP | Pi → VM | SSH notifications |
 | 8080 | TCP | Browser → Pi | Web portal |
+| 4000+ | TCP | VM → Pi | RFC2217 serial (optional) |
 
 ## Pairing Relationship
 
@@ -215,9 +222,69 @@ ls -la /dev/ttyUSB* /dev/ttyACM*
 - Consider firewall rules limiting access
 - Portal runs as root for device access
 
+## RFC2217 Alternative (ESP32 Development)
+
+For ESP32/ESP8266 development, RFC2217 provides a simpler alternative to USB/IP. It exposes the serial port directly over TCP without kernel modules.
+
+### Comparison
+
+| Feature | USB/IP | RFC2217 |
+|---------|--------|---------|
+| Complexity | High (kernel modules) | Low (userspace only) |
+| Blocking risk | Yes (kernel hangs) | No |
+| Device appears as | /dev/ttyUSB0 | Network socket |
+| esptool support | Native | Native (`rfc2217://host:port`) |
+| Other USB devices | Yes (any USB) | No (serial only) |
+
+### When to Use RFC2217
+
+- ESP32/ESP8266 development only
+- You only need serial (flashing + monitoring)
+- You want reliability over complexity
+
+### When to Use USB/IP
+
+- Need non-serial USB devices (JTAG, HID, etc.)
+- Software requires a real /dev/ttyUSB* path
+- Multiple device types on same Pi
+
+### Per-Device Mode Selection
+
+The web portal allows selecting USB/IP or RFC2217 mode per device:
+
+1. Open the portal at `http://<pi-ip>:8080`
+2. Find the device in the USB Devices list
+3. Use the mode dropdown to select "USB/IP" or "RFC2217"
+4. RFC2217 devices show their port number (e.g., 4000)
+
+### Using RFC2217 from Containers
+
+```bash
+# esptool (use --no-stub for reliability)
+esptool --no-stub --port 'rfc2217://192.168.0.87:4000?ign_set_control' chip_id
+esptool --no-stub --port 'rfc2217://192.168.0.87:4000?ign_set_control' flash_id
+
+# ESP-IDF
+export ESPPORT='rfc2217://192.168.0.87:4000?ign_set_control'
+idf.py flash monitor
+
+# PlatformIO (platformio.ini)
+upload_port = rfc2217://192.168.0.87:4000?ign_set_control
+monitor_port = rfc2217://192.168.0.87:4000?ign_set_control
+```
+
+### RFC2217 Network Ports
+
+| Port | Purpose |
+|------|---------|
+| 4000 | First RFC2217 device |
+| 4001 | Second RFC2217 device |
+| ... | Additional devices |
+
 ## Performance Notes
 
 - USB/IP adds minimal latency for serial devices
+- RFC2217 may have slightly higher latency but better reliability
 - Baud rates up to 921600 work reliably
 - Use wired Ethernet over Wi-Fi for stability
 - Short USB cables reduce signal issues

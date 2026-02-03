@@ -9,6 +9,7 @@ import os
 import re
 import socketserver
 import signal
+import time
 from urllib.parse import urlparse
 
 PORT = 8080
@@ -248,7 +249,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         busid, rest = line.strip().split('=', 1)
                         parts = rest.split(',')
                         mode = parts[0] if parts else 'usbip'
-                        port = int(parts[1]) if len(parts) > 1 else None
+                        port = int(parts[1]) if len(parts) > 1 and parts[1] and parts[1] != 'None' else None
                         config[busid] = {'mode': mode, 'port': port}
         return config
 
@@ -258,7 +259,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with open(DEVICES_CONFIG, 'w') as f:
             f.write("# Device mode config: busid=mode,port\n")
             for busid, data in config.items():
-                port = data.get('port', '')
+                port = data.get('port') or ''
                 f.write(f"{busid}={data['mode']},{port}\n")
 
     def get_next_rfc2217_port(self, config):
@@ -309,18 +310,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def start_rfc2217(self, busid, port):
         """Start RFC2217 server for device"""
-        tty = self.get_tty_for_busid(busid)
-        if not tty:
-            return False, f"No tty found for {busid}"
-
-        # First unbind from usbip
+        # First unbind from usbip to release the device
         subprocess.run(['/usr/sbin/usbip', 'unbind', '-b', busid],
             capture_output=True, timeout=10)
+
+        # Wait for tty to appear (kernel needs to rebind to serial driver)
+        tty = None
+        for _ in range(20):  # Wait up to 2 seconds
+            time.sleep(0.1)
+            tty = self.get_tty_for_busid(busid)
+            if tty:
+                break
+
+        if not tty:
+            # Re-bind to usbip since RFC2217 failed
+            subprocess.run(['/usr/sbin/usbip', 'bind', '-b', busid],
+                capture_output=True, timeout=10)
+            return False, f"No tty appeared for {busid} after unbind"
 
         # Start esp_rfc2217_server
         try:
             proc = subprocess.Popen(
-                ['esp_rfc2217_server.py', '-p', str(port), tty],
+                ['/usr/local/bin/esp_rfc2217_server', '-p', str(port), tty],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True)
             return True, f"Started RFC2217 on port {port} for {tty}"
