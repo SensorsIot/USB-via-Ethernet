@@ -6,6 +6,7 @@ EVENT="$1"
 BUSID="$2"
 PI_HOSTNAME="$3"
 LOG_TAG="usb-event"
+USBIP_TIMEOUT=10  # seconds - prevent hanging on kernel issues
 
 # Load config - always use configured IP (1:1 relationship)
 [ -f /etc/usbip/pi.conf ] && source /etc/usbip/pi.conf
@@ -16,26 +17,26 @@ logger -t "$LOG_TAG" "Event: $EVENT, BusID: $BUSID, Pi: $PI_HOST (hostname: $PI_
 case "$EVENT" in
     connect|boot)
         # Check if already attached
-        if sudo /usr/sbin/usbip port 2>/dev/null | grep -q "$BUSID"; then
+        if timeout $USBIP_TIMEOUT sudo /usr/sbin/usbip port 2>/dev/null | grep -q "$BUSID"; then
             logger -t "$LOG_TAG" "Device $BUSID already attached"
             echo "OK"
             exit 0
         fi
         # Attach new device (don't detach existing ones)
-        if sudo /usr/sbin/usbip attach -r "$PI_HOST" -b "$BUSID" 2>/dev/null; then
+        if timeout $USBIP_TIMEOUT sudo /usr/sbin/usbip attach -r "$PI_HOST" -b "$BUSID" 2>/dev/null; then
             logger -t "$LOG_TAG" "Attached $BUSID from $PI_HOST"
             echo "OK"
         else
-            logger -t "$LOG_TAG" "Failed to attach $BUSID from $PI_HOST"
+            logger -t "$LOG_TAG" "Failed to attach $BUSID from $PI_HOST (timeout or error)"
             echo "FAIL"
             exit 1
         fi
         ;;
     disconnect)
         # Find and detach specific device
-        port=$(sudo /usr/sbin/usbip port 2>/dev/null | grep -B1 "$BUSID" | grep -oP "Port \K[0-9]+")
+        port=$(timeout $USBIP_TIMEOUT sudo /usr/sbin/usbip port 2>/dev/null | grep -B1 "$BUSID" | grep -oP "Port \K[0-9]+")
         if [ -n "$port" ]; then
-            sudo /usr/sbin/usbip detach -p "$port" 2>/dev/null
+            timeout $USBIP_TIMEOUT sudo /usr/sbin/usbip detach -p "$port" 2>/dev/null
             logger -t "$LOG_TAG" "Detached port $port (busid $BUSID)"
         fi
         echo "OK"

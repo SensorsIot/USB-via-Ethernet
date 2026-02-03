@@ -3,18 +3,22 @@
 source /etc/usbip/pi.conf 2>/dev/null || exit 0
 
 LOG_TAG="usb-boot"
+USBIP_TIMEOUT=10  # seconds - prevent hanging on kernel issues
+
 logger -t "$LOG_TAG" "Checking for devices on $DEFAULT_PI_HOST"
 
-for busid in $(sudo /usr/sbin/usbip list -r "$DEFAULT_PI_HOST" 2>/dev/null | \
+for busid in $(timeout $USBIP_TIMEOUT sudo /usr/sbin/usbip list -r "$DEFAULT_PI_HOST" 2>/dev/null | \
     grep -oP "^\s+\K[0-9]+-[0-9]+(\.[0-9]+)*"); do
     # Skip ethernet adapters
-    if sudo /usr/sbin/usbip list -r "$DEFAULT_PI_HOST" 2>/dev/null | \
+    if timeout $USBIP_TIMEOUT sudo /usr/sbin/usbip list -r "$DEFAULT_PI_HOST" 2>/dev/null | \
         grep -A1 "$busid" | grep -qi "ethernet"; then
         logger -t "$LOG_TAG" "Skipping ethernet adapter $busid"
         continue
     fi
     # Attach device
-    if sudo /usr/sbin/usbip attach -r "$DEFAULT_PI_HOST" -b "$busid" 2>/dev/null; then
+    if timeout $USBIP_TIMEOUT sudo /usr/sbin/usbip attach -r "$DEFAULT_PI_HOST" -b "$busid" 2>/dev/null; then
         logger -t "$LOG_TAG" "Attached $busid from $DEFAULT_PI_HOST"
+    else
+        logger -t "$LOG_TAG" "Failed to attach $busid (timeout or error)"
     fi
 done
