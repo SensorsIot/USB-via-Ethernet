@@ -32,6 +32,7 @@ LOG_DIR = "/var/log/serial"
 slots: dict[str, dict] = {}
 seq_counter: int = 0
 host_ip: str = "127.0.0.1"
+hostname: str = "localhost"
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +80,11 @@ def get_host_ip() -> str:
         return ip
     except Exception:
         return "127.0.0.1"
+
+
+def get_hostname() -> str:
+    """Get the system hostname (used for mDNS / display)."""
+    return socket.gethostname()
 
 
 def _find_proxy_exe() -> str | None:
@@ -236,6 +242,59 @@ def _make_dynamic_slot(slot_key: str) -> dict:
     }
 
 
+def scan_existing_devices():
+    """Scan for already-plugged-in USB serial devices and start proxies.
+
+    Called once at startup so devices present at boot are recognized
+    without requiring a hotplug event.
+    """
+    import glob as _glob
+    import subprocess as _sp
+
+    devnodes = sorted(_glob.glob("/dev/ttyACM*") + _glob.glob("/dev/ttyUSB*"))
+    if not devnodes:
+        print("[portal] boot scan: no USB serial devices found", flush=True)
+        return
+
+    print(f"[portal] boot scan: found {len(devnodes)} device(s)", flush=True)
+    for devnode in devnodes:
+        # Get ID_PATH from udevadm
+        try:
+            out = _sp.check_output(
+                ["udevadm", "info", "-q", "property", "-n", devnode],
+                text=True, timeout=5,
+            )
+        except Exception as exc:
+            print(f"[portal] boot scan: udevadm failed for {devnode}: {exc}", flush=True)
+            continue
+
+        props = {}
+        for line in out.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                props[k] = v
+
+        id_path = props.get("ID_PATH", "")
+        devpath = props.get("DEVPATH", "")
+        slot_key = id_path if id_path else devpath
+        if not slot_key:
+            print(f"[portal] boot scan: no slot_key for {devnode}, skipping", flush=True)
+            continue
+
+        if slot_key not in slots:
+            slots[slot_key] = _make_dynamic_slot(slot_key)
+            print(f"[portal] boot scan: unknown slot_key={slot_key} (tracked, no proxy)", flush=True)
+
+        slot = slots[slot_key]
+        slot["present"] = True
+        slot["devnode"] = devnode
+
+        if slot["tcp_port"] is not None and not slot["running"]:
+            print(f"[portal] boot scan: starting proxy for {slot['label']} ({devnode})", flush=True)
+            with slot["_lock"]:
+                start_proxy(slot)
+
+
 def _refresh_slot_health(slot: dict):
     """Check that a slot's proxy is still alive; mark dead if not."""
     if slot["running"] and slot["pid"]:
@@ -317,11 +376,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         for slot in slots.values():
             _refresh_slot_health(slot)
             infos.append(_slot_info(slot))
-        self._send_json({"slots": infos, "host_ip": host_ip})
+        self._send_json({"slots": infos, "host_ip": host_ip, "hostname": hostname})
 
     def _handle_get_info(self):
         self._send_json({
             "host_ip": host_ip,
+            "hostname": hostname,
             "slots_configured": sum(1 for s in slots.values() if s["tcp_port"] is not None),
             "slots_running": sum(1 for s in slots.values() if s["running"]),
         })
@@ -514,17 +574,26 @@ _UI_HTML = """\
     </style>
 </head>
 <body>
-    <h1>RFC2217 Serial Portal</h1>
+    <h1 id="title">RFC2217 Serial Portal</h1>
     <div class="slots" id="slots"></div>
     <div class="info" id="info">Auto-refresh every 2 seconds</div>
 <script>
+let hostName = '';
+let hostIp = '';
+
 async function fetchDevices() {
     try {
         const resp = await fetch('/api/devices');
         const data = await resp.json();
+        hostName = data.hostname || '';
+        hostIp = data.host_ip || '';
+        if (hostName) {
+            document.getElementById('title').textContent = hostName + ' — RFC2217 Serial Portal';
+            document.title = hostName + ' — RFC2217 Serial Portal';
+        }
         renderSlots(data.slots);
         document.getElementById('info').textContent =
-            'Host: ' + data.host_ip + '  |  Auto-refresh every 2s';
+            'Hostname: ' + hostName + '  |  IP: ' + hostIp + '  |  Auto-refresh every 2s';
     } catch (e) {
         console.error('Error fetching devices:', e);
     }
@@ -546,6 +615,9 @@ function renderSlots(slots) {
     el.innerHTML = slots.map(s => {
         const st = slotStatus(s);
         const label = s.label || s.slot_key.slice(-20);
+        const hostnameUrl = s.running && hostName ? 'rfc2217://' + hostName + ':' + s.tcp_port : '';
+        const ipUrl = s.url || '';
+        const copyTarget = hostnameUrl || ipUrl;
         return `
         <div class="slot ${st}">
             <div class="slot-header">
@@ -558,8 +630,8 @@ function renderSlots(slots) {
                 ${s.pid ? '<div>PID: <span>' + s.pid + '</span></div>' : ''}
             </div>
             <div class="url-box ${s.running ? '' : 'empty'}"
-                 onclick="${s.running ? "copyUrl('" + s.url + "',this)" : ''}">
-                ${s.running ? s.url : (s.present ? 'Device present, proxy not running' : 'No device connected')}
+                 onclick="${s.running ? "copyUrl('" + copyTarget + "',this)" : ''}">
+                ${s.running ? hostnameUrl + '<br><small style=\\'color:#888\\'>' + ipUrl + '</small>' : (s.present ? 'Device present, proxy not running' : 'No device connected')}
             </div>
             ${s.last_error ? '<div class="error">Error: ' + s.last_error + '</div>' : ''}
         </div>`;
@@ -586,10 +658,11 @@ setInterval(fetchDevices, 2000);
 # ---------------------------------------------------------------------------
 
 def main():
-    global slots, host_ip
+    global slots, host_ip, hostname
 
     slots = load_config(CONFIG_FILE)
     host_ip = get_host_ip()
+    hostname = get_hostname()
 
     # Pre-compute URLs for configured slots
     for slot in slots.values():
@@ -598,11 +671,15 @@ def main():
 
     os.makedirs(LOG_DIR, exist_ok=True)
 
+    # Scan for devices already plugged in at boot
+    scan_existing_devices()
+
     addr = ("", PORT)
     http.server.HTTPServer.allow_reuse_address = True
     httpd = http.server.HTTPServer(addr, Handler)
     print(
-        f"[portal] v3 listening on http://0.0.0.0:{PORT}  host_ip={host_ip}",
+        f"[portal] v3 listening on http://0.0.0.0:{PORT}  "
+        f"host_ip={host_ip}  hostname={hostname}",
         flush=True,
     )
     try:

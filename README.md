@@ -20,7 +20,7 @@ Move the USB devices to a **cheap Raspberry Pi** (even a Pi Zero works) and shar
 From any container or VM on the network, connect with a single line:
 
 ```python
-ser = serial.serial_for_url("rfc2217://192.168.0.87:4001?ign_set_control")
+ser = serial.serial_for_url("rfc2217://serial1:4001?ign_set_control")
 ```
 
 ## 📋 What It Does
@@ -118,7 +118,7 @@ Open **http://\<pi-ip\>:8080** in your browser.
 ```python
 import serial
 
-ser = serial.serial_for_url("rfc2217://192.168.0.87:4001?ign_set_control", baudrate=115200)
+ser = serial.serial_for_url("rfc2217://serial1:4001?ign_set_control", baudrate=115200)
 while True:
     line = ser.readline()
     if line:
@@ -128,8 +128,8 @@ while True:
 **esptool (flashing):**
 
 ```bash
-esptool --port 'rfc2217://192.168.0.87:4001?ign_set_control' write_flash 0x0 firmware.bin
-esptool --port 'rfc2217://192.168.0.87:4001?ign_set_control' chip_id
+esptool --port 'rfc2217://serial1:4001?ign_set_control' write_flash 0x0 firmware.bin
+esptool --port 'rfc2217://serial1:4001?ign_set_control' chip_id
 ```
 
 **PlatformIO:**
@@ -139,14 +139,14 @@ esptool --port 'rfc2217://192.168.0.87:4001?ign_set_control' chip_id
 [env:esp32]
 platform = espressif32
 board = esp32dev
-upload_port = rfc2217://192.168.0.87:4001?ign_set_control
-monitor_port = rfc2217://192.168.0.87:4001?ign_set_control
+upload_port = rfc2217://serial1:4001?ign_set_control
+monitor_port = rfc2217://serial1:4001?ign_set_control
 ```
 
 **ESP-IDF:**
 
 ```bash
-export ESPPORT='rfc2217://192.168.0.87:4001?ign_set_control'
+export ESPPORT='rfc2217://serial1:4001?ign_set_control'
 idf.py flash monitor
 ```
 
@@ -154,7 +154,7 @@ idf.py flash monitor
 
 ```bash
 apt install -y socat
-socat pty,link=/dev/ttyESP32,raw,echo=0 tcp:192.168.0.87:4001 &
+socat pty,link=/dev/ttyESP32,raw,echo=0 tcp:serial1:4001 &
 cat /dev/ttyESP32
 ```
 
@@ -171,7 +171,7 @@ services:
     volumes:
       - ./monitor.py:/app/monitor.py
     environment:
-      - ESP32_PORT=rfc2217://192.168.0.87:4001?ign_set_control
+      - ESP32_PORT=rfc2217://serial1:4001?ign_set_control
 ```
 
 **LXC Container:**
@@ -230,8 +230,8 @@ The portal exposes a JSON API on port 8080:
 | POST | `/api/stop` | Manually stop a proxy (`slot_key`) |
 
 ```bash
-curl http://192.168.0.87:8080/api/devices
-curl http://192.168.0.87:8080/api/info
+curl http://serial1:8080/api/devices
+curl http://serial1:8080/api/info
 ```
 
 ### 📂 Files
