@@ -6,11 +6,29 @@
 [![RFC2217](https://img.shields.io/badge/Protocol-RFC2217-green.svg)](https://datatracker.ietf.org/doc/html/rfc2217)
 [![Python](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](https://www.python.org/)
 
-> Share USB serial devices (ESP32, Arduino) from a Raspberry Pi to containers over the network using RFC2217. Slot-based device management with automatic proxy supervision and serial traffic logging.
+## The Problem
+
+Proxmox (and other hypervisors) can only pass an **entire USB controller** to a single VM — not individual ports. If you have three ESP32 boards on one USB controller, only one VM can access them. You can't split them across containers or VMs.
+
+Buying a dedicated USB PCIe card per VM gets expensive fast and doesn't help with containers (LXC), which can't do USB passthrough at all.
+
+## The Solution
+
+Move the USB devices to a **cheap Raspberry Pi** (even a Pi Zero works) and share them over the network using the RFC2217 serial protocol. Any number of VMs and containers can each connect to their own device — no USB passthrough needed.
+
+Plug a device in, and the Pi automatically starts an RFC2217 server for it on a fixed TCP port. Unplug it, and the server stops. A web portal shows what's running and lets you copy connection URLs.
+
+From any container or VM on the network, connect with a single line:
+
+```python
+ser = serial.serial_for_url("rfc2217://192.168.0.87:4001?ign_set_control")
+```
+
+This works for **monitoring**, **flashing** (esptool, PlatformIO, ESP-IDF), and any tool that supports RFC2217 or pyserial.
 
 ---
 
-## 📡 Scenario
+## 📡 How It Works
 
 ```
                                     Proxmox Host
@@ -29,11 +47,7 @@
                                    └─────────────────────────────────┘
 ```
 
-**Your setup:**
-- 2 ESP32 devices connected via USB to a Raspberry Pi Zero
-- Pi Zero connected to Proxmox network
-- VM running 2 containers
-- Each container uses one ESP32 via RFC2217
+Each physical USB port on the Pi's hub is a **slot** with a fixed TCP port. The mapping is based on the physical connector position — not the device plugged into it — so you can swap boards and the port stays the same.
 
 ---
 
