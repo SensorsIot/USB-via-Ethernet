@@ -491,12 +491,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         slot["_event_times"] = [t for t in slot["_event_times"] if now - t < FLAP_WINDOW_S]
 
         # Recovery: if already flapping, check if device has been quiet long enough
-        if slot["flapping"] and len(slot["_event_times"]) >= 2:
-            gap = slot["_event_times"][-1] - slot["_event_times"][-2]
-            if gap >= FLAP_COOLDOWN_S:
+        if slot["flapping"]:
+            if len(slot["_event_times"]) < 2:
+                # All previous events aged out of window — quiet for >= FLAP_WINDOW_S
                 slot["flapping"] = False
                 slot["last_error"] = None
-                print(f'[portal] {label}: USB flapping cleared (quiet for {gap:.0f}s)', flush=True)
+                print(f'[portal] {label}: USB flapping cleared (events aged out)', flush=True)
+            else:
+                gap = slot["_event_times"][-1] - slot["_event_times"][-2]
+                if gap >= FLAP_COOLDOWN_S:
+                    slot["flapping"] = False
+                    slot["last_error"] = None
+                    print(f'[portal] {label}: USB flapping cleared (quiet for {gap:.0f}s)', flush=True)
 
         # Detect new flapping
         if not slot["flapping"] and len(slot["_event_times"]) >= FLAP_THRESHOLD:
@@ -520,10 +526,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # HTTP response for the settle + port-listen check.
                 def _bg_start(s=slot, lk=lock):
                     with lk:
+                        if s["flapping"]:
+                            return  # Flapping detected while queued
                         # Stop existing proxy first if still running
                         if s["running"] and s["pid"]:
                             stop_proxy(s)
                         start_proxy(s)
+                        # If flapping was detected during start_proxy, restore its error
+                        if s["flapping"]:
+                            s["last_error"] = "USB flapping detected \u2014 device is connect/disconnect cycling"
                 threading.Thread(target=_bg_start, daemon=True).start()
             else:
                 print(
