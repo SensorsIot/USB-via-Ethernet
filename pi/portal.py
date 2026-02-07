@@ -903,9 +903,8 @@ function renderSlots(slots) {
     el.innerHTML = slots.map(s => {
         const st = slotStatus(s);
         const label = s.label || s.slot_key.slice(-20);
-        const hostnameUrl = s.running && hostName ? 'rfc2217://' + hostName + ':' + s.tcp_port : '';
         const ipUrl = s.url || '';
-        const copyTarget = hostnameUrl || ipUrl;
+        const copyTarget = ipUrl;
         return `
         <div class="slot ${st}">
             <div class="slot-header">
@@ -919,7 +918,7 @@ function renderSlots(slots) {
             </div>
             <div class="url-box ${s.running ? '' : 'empty'}"
                  onclick="${s.running ? "copyUrl('" + copyTarget + "',this)" : ''}">
-                ${s.running ? hostnameUrl + '<br><small style=\\'color:#888\\'>' + ipUrl + '</small>' : (s.present ? 'Device present, proxy not running' : 'No device connected')}
+                ${s.running ? ipUrl : (s.present ? 'Device present, proxy not running' : 'No device connected')}
             </div>
             ${s.last_error ? '<div class="error">Error: ' + s.last_error + '</div>' : ''}
             ${s.flapping ? '<div class="flap-warning">&#9888; Device is boot-looping (rapid USB connect/disconnect). Proxy start suppressed until device stabilises.</div>' : ''}
