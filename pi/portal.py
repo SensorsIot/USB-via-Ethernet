@@ -28,6 +28,7 @@ PROXY_PATHS = [
     "/usr/local/bin/serial_proxy.py",
     "/usr/local/bin/serial-proxy",
 ]
+PLAIN_RFC2217_PATH = "/usr/local/bin/plain_rfc2217_server.py"
 LOG_DIR = "/var/log/serial"
 
 # Module-level state
@@ -150,7 +151,14 @@ def start_proxy(slot: dict) -> bool:
     tcp_port = slot["tcp_port"]
     label = slot["label"]
 
-    proxy_exe = _find_proxy_exe()
+    # Use plain RFC2217 for native USB CDC (ttyACM) devices like ESP32-C3.
+    # esp_rfc2217_server intercepts DTR/RTS which breaks C3 bootloader entry.
+    is_native_usb = devnode and "ttyACM" in devnode
+    if is_native_usb and os.path.exists(PLAIN_RFC2217_PATH):
+        proxy_exe = PLAIN_RFC2217_PATH
+        print(f"[portal] {label}: using plain RFC2217 (native USB CDC)", flush=True)
+    else:
+        proxy_exe = _find_proxy_exe()
     if not proxy_exe:
         slot["last_error"] = "No serial proxy executable found"
         print(f"[portal] {label}: {slot['last_error']}", flush=True)

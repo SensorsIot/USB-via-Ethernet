@@ -24,11 +24,13 @@ sudo mkdir -p /var/log/serial
 echo "Installing scripts..."
 sudo cp "$SCRIPT_DIR/portal.py" /usr/local/bin/rfc2217-portal
 sudo cp "$SCRIPT_DIR/serial_proxy.py" /usr/local/bin/serial_proxy.py
+sudo cp "$SCRIPT_DIR/plain_rfc2217_server.py" /usr/local/bin/plain_rfc2217_server.py
 sudo cp "$SCRIPT_DIR/wifi_controller.py" /usr/local/bin/wifi_controller.py
 sudo cp "$SCRIPT_DIR/rfc2217-learn-slots" /usr/local/bin/rfc2217-learn-slots
 
 sudo chmod +x /usr/local/bin/rfc2217-portal
 sudo chmod +x /usr/local/bin/serial_proxy.py
+sudo chmod +x /usr/local/bin/plain_rfc2217_server.py
 sudo chmod +x /usr/local/bin/rfc2217-learn-slots
 
 # Install udev notify script
