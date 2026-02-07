@@ -31,6 +31,11 @@ PROXY_PATHS = [
 PLAIN_RFC2217_PATH = "/usr/local/bin/plain_rfc2217_server.py"
 LOG_DIR = "/var/log/serial"
 
+# Flap detection — suppress proxy restarts during USB connect/disconnect storms
+FLAP_WINDOW_S = 30       # Look at events within this window
+FLAP_THRESHOLD = 6        # 6 events in 30s = 3 connect/disconnect cycles
+FLAP_COOLDOWN_S = 30      # After flapping, wait 30s of quiet before retry
+
 # Module-level state
 slots: dict[str, dict] = {}
 seq_counter: int = 0
@@ -63,6 +68,8 @@ def load_config(path: str) -> dict[str, dict]:
                 "last_event_ts": None,
                 "url": None,
                 "last_error": None,
+                "flapping": False,
+                "_event_times": [],
                 "_lock": threading.Lock(),
             }
         print(f"[portal] loaded {len(result)} slot(s) from {path}", flush=True)
@@ -261,6 +268,8 @@ def _make_dynamic_slot(slot_key: str) -> dict:
         "last_event_ts": None,
         "url": None,
         "last_error": None,
+        "flapping": False,
+        "_event_times": [],
         "_lock": threading.Lock(),
     }
 
@@ -472,13 +481,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
         slot["last_action"] = action
         slot["last_event_ts"] = datetime.now(timezone.utc).isoformat()
 
+        label = slot["label"] or slot_key[-20:]
         configured = slot["tcp_port"] is not None
+
+        # -- Flap detection --
+        now = time.time()
+        slot["_event_times"].append(now)
+        # Prune events older than window
+        slot["_event_times"] = [t for t in slot["_event_times"] if now - t < FLAP_WINDOW_S]
+
+        # Recovery: if already flapping, check if device has been quiet long enough
+        if slot["flapping"] and len(slot["_event_times"]) >= 2:
+            gap = slot["_event_times"][-1] - slot["_event_times"][-2]
+            if gap >= FLAP_COOLDOWN_S:
+                slot["flapping"] = False
+                slot["last_error"] = None
+                print(f'[portal] {label}: USB flapping cleared (quiet for {gap:.0f}s)', flush=True)
+
+        # Detect new flapping
+        if not slot["flapping"] and len(slot["_event_times"]) >= FLAP_THRESHOLD:
+            slot["flapping"] = True
+            slot["last_error"] = "USB flapping detected — device is connect/disconnect cycling"
+            print(f'[portal] {label}: USB flapping detected ({len(slot["_event_times"])} events in {FLAP_WINDOW_S}s)', flush=True)
+            # Stop proxy proactively if running
+            if slot["running"] and slot["pid"]:
+                with lock:
+                    stop_proxy(slot)
+                slot["last_error"] = "USB flapping detected — device is connect/disconnect cycling"
 
         if action == "add":
             slot["present"] = True
             slot["devnode"] = devnode
 
-            if configured:
+            if slot["flapping"]:
+                pass  # No proxy start; UI shows warning
+            elif configured:
                 # Start proxy in a background thread so we don't block the
                 # HTTP response for the settle + port-listen check.
                 def _bg_start(s=slot, lk=lock):
@@ -512,6 +549,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "slot_key": slot_key,
             "seq": seq_counter,
             "accepted": configured,
+            "flapping": slot["flapping"],
         })
 
     def _handle_start(self):
@@ -724,6 +762,7 @@ _UI_HTML = """\
             border: 2px solid #0f3460; transition: all 0.3s;
         }
         .slot.running { border-color: #00d4ff; box-shadow: 0 0 20px rgba(0,212,255,0.2); }
+        .slot.flapping { border-color: #e74c3c; background: #1a0000; }
         .slot.present { border-color: #555; }
         .slot-header {
             display: flex; justify-content: space-between;
@@ -735,6 +774,7 @@ _UI_HTML = """\
             font-size: 0.85em; font-weight: bold;
         }
         .status.running { background: #00d4ff; color: #1a1a2e; }
+        .status.flapping { background: #e74c3c; color: #fff; }
         .status.present { background: #555; color: #ccc; }
         .status.stopped { background: #333; color: #666; }
         .slot-info { font-size: 0.9em; color: #aaa; margin-bottom: 15px; }
@@ -749,6 +789,10 @@ _UI_HTML = """\
         .url-box.empty { color: #666; cursor: default; }
         .copied { background: #00d4ff !important; color: #1a1a2e !important; }
         .error { color: #ff6b6b; font-size: 0.85em; margin-top: 10px; }
+        .flap-warning {
+            color: #e74c3c; font-weight: bold; padding: 6px 10px;
+            background: rgba(231,76,60,0.15); border-radius: 4px; margin-top: 8px;
+        }
         .info { text-align: center; color: #666; margin-top: 30px; font-size: 0.85em; }
         /* WiFi Tester section */
         .wifi-section {
@@ -842,11 +886,13 @@ async function fetchWifi() {
 }
 
 function slotStatus(s) {
+    if (s.flapping) return 'flapping';
     if (s.running) return 'running';
     if (s.present) return 'present';
     return 'stopped';
 }
 function statusLabel(s) {
+    if (s.flapping) return 'FLAPPING';
     if (s.running) return 'RUNNING';
     if (s.present) return 'PRESENT';
     return 'EMPTY';
@@ -876,6 +922,7 @@ function renderSlots(slots) {
                 ${s.running ? hostnameUrl + '<br><small style=\\'color:#888\\'>' + ipUrl + '</small>' : (s.present ? 'Device present, proxy not running' : 'No device connected')}
             </div>
             ${s.last_error ? '<div class="error">Error: ' + s.last_error + '</div>' : ''}
+            ${s.flapping ? '<div class="flap-warning">&#9888; Device is boot-looping (rapid USB connect/disconnect). Proxy start suppressed until device stabilises.</div>' : ''}
         </div>`;
     }).join('');
 }
