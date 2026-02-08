@@ -21,7 +21,9 @@ of esp_rfc2217_server automatically.
 import argparse
 import logging
 import socket
+import termios
 import threading
+import time
 
 import serial
 import serial.rfc2217
@@ -48,6 +50,22 @@ def main():
     ser.dtr = False
     ser.rts = False
     ser.open()
+    # Linux CDC ACM driver asserts DTR+RTS on open.  On ESP32-C3 native USB,
+    # the USB-Serial/JTAG controller interprets DTR/RTS as reset + boot-mode
+    # signals.  DTR=1 → GPIO9 LOW (download mode), RTS=1 → chip in reset.
+    #
+    # Controlled boot sequence to ensure SPI boot (not download mode):
+    #   1. Clear DTR first  → GPIO9 HIGH (SPI boot selected)
+    #   2. Brief delay      → let the USB-JTAG controller see DTR=0
+    #   3. Clear RTS        → release reset → chip boots in SPI mode
+    if hasattr(ser, 'fd'):
+        attrs = termios.tcgetattr(ser.fd)
+        attrs[2] &= ~termios.HUPCL  # cflag: clear HUPCL
+        termios.tcsetattr(ser.fd, termios.TCSANOW, attrs)
+    ser.dtr = False          # GPIO9 HIGH — select SPI boot
+    time.sleep(0.1)          # Let USB-JTAG controller latch DTR=0
+    ser.rts = False          # Release reset — chip boots normally
+    time.sleep(0.1)
     settings = ser.get_settings()
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

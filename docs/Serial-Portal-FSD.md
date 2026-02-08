@@ -79,7 +79,8 @@ Mode is switched via `POST /api/wifi/mode` or the web UI toggle.
 |-----------|----------|---------|
 | portal.py (rfc2217-portal) | /usr/local/bin/rfc2217-portal | Web UI, HTTP API, proxy supervisor, hotplug handler, WiFi API |
 | wifi_controller.py | /usr/local/bin/wifi_controller.py | WiFi instrument backend (AP, STA, scan, relay, events) |
-| esp_rfc2217_server.py | /usr/local/bin/esp_rfc2217_server.py | RFC2217 server from esptool (preferred, stable) |
+| plain_rfc2217_server.py | /usr/local/bin/plain_rfc2217_server.py | RFC2217 server with direct DTR/RTS passthrough (all devices) |
+| esp_rfc2217_server.py | /usr/local/bin/esp_rfc2217_server.py | RFC2217 server from esptool (deprecated — breaks C3 native USB, not needed for ttyUSB) |
 | serial_proxy.py | /usr/local/bin/serial_proxy.py | RFC2217 server with logging (fallback) |
 | rfc2217-udev-notify.sh | /usr/local/bin/rfc2217-udev-notify.sh | Posts udev events to portal API |
 | wifi-lease-notify.sh | /usr/local/bin/wifi-lease-notify.sh | Posts dnsmasq DHCP lease events to portal API |
@@ -99,7 +100,7 @@ Mode is switched via `POST /api/wifi/mode` or the web UI toggle.
 | **Slot** | One physical connector position on the USB hub |
 | **slot_key** | Stable identifier for physical port topology (derived from udev `ID_PATH`) |
 | **devnode** | Current tty device path (e.g., `/dev/ttyACM0`) — may change on reconnect |
-| **proxy** | RFC2217 server process for a serial device (`esp_rfc2217_server.py` preferred, `serial_proxy.py` fallback) |
+| **proxy** | RFC2217 server process for a serial device: `plain_rfc2217_server.py` for all devices (direct DTR/RTS passthrough) |
 | **seq** (sequence) | Global monotonically increasing counter, incremented on every hotplug event |
 | **Mode** | Operating mode: `wifi-testing` (wlan0 = instrument) or `serial-interface` (wlan0 = LAN) |
 
@@ -183,7 +184,8 @@ Configuration file: `/etc/rfc2217/slots.json`
       "seq": 5,
       "last_action": "add",
       "last_event_ts": "2026-02-05T12:34:56+00:00",
-      "last_error": null
+      "last_error": null,
+      "flapping": false
     }
   ],
   "host_ip": "192.168.0.87",
@@ -211,6 +213,209 @@ Configuration file: `/etc/rfc2217/slots.json`
 - Copy RFC2217 URL to clipboard (hostname and IP variants)
 - Start/stop individual slots
 - Display connection examples
+
+### FR-006 — ESP32-C3 Native USB-Serial/JTAG Support
+
+ESP32-C3 (and ESP32-S3) chips with native USB use a built-in USB-Serial/JTAG
+controller that maps to `/dev/ttyACM*` on Linux (CDC ACM class).  This differs
+fundamentally from UART bridge chips (CP2102, CH340 → `/dev/ttyUSB*`) in how
+DTR/RTS signals are interpreted.
+
+#### 6.1 USB-Serial/JTAG Signal Mapping
+
+| Signal | GPIO | Function |
+|--------|------|----------|
+| DTR | GPIO9 | Boot strap: DTR=1 → GPIO9 LOW → **download mode** |
+| RTS | CHIP_EN | Reset: RTS=1 → chip held in **reset** |
+
+The Linux `cdc_acm` kernel driver asserts **both DTR=1 and RTS=1** in
+`acm_port_activate()` on every port open.  This puts the chip into download
+mode during the boot-sensitive phase.
+
+#### 6.2 Proxy Selection
+
+The portal uses `plain_rfc2217_server.py` for **all** device types:
+
+| devnode | Device Type | Server |
+|---------|-------------|--------|
+| `/dev/ttyACM*` | Native USB (CDC ACM) | `plain_rfc2217_server.py` |
+| `/dev/ttyUSB*` | UART bridge (CP2102/CH340) | `plain_rfc2217_server.py` |
+
+**Why not `esp_rfc2217_server.py`?**  Espressif's `EspPortManager` intercepts
+DTR/RTS and replaces them with its own reset sequence (`ClassicReset` /
+`HardReset`) in a separate thread.  This breaks ESP32-C3 native USB, and
+testing confirmed it also fails for classic ESP32 UART bridges over RFC2217.
+`plain_rfc2217_server.py` passes DTR/RTS directly — esptool on the client
+side already implements the correct reset sequences for each chip type.
+
+#### 6.3 Controlled Boot Sequence (plain_rfc2217_server.py)
+
+When `plain_rfc2217_server.py` opens the serial port, it performs a controlled
+boot sequence to ensure the chip boots in SPI mode (not download mode):
+
+```python
+ser = serial.serial_for_url(port, do_not_open=True, exclusive=False)
+ser.timeout = 3
+ser.dtr = False   # Pre-set: GPIO9 HIGH (SPI boot)
+ser.rts = False   # Pre-set: not in reset
+ser.open()
+# Linux cdc_acm still asserts DTR+RTS on open, but pyserial immediately
+# applies the pre-set values in _reconfigure_port()
+
+# Clear HUPCL to prevent DTR assertion on close
+attrs = termios.tcgetattr(ser.fd)
+attrs[2] &= ~termios.HUPCL
+termios.tcsetattr(ser.fd, termios.TCSANOW, attrs)
+
+ser.dtr = False   # GPIO9 HIGH — select SPI boot
+time.sleep(0.1)   # Let USB-JTAG controller latch DTR=0
+ser.rts = False   # Release reset — chip boots normally
+time.sleep(0.1)
+```
+
+#### 6.4 Device Settle Check (ttyACM)
+
+For ttyACM devices, `wait_for_device()` checks only that the device node
+exists — it does **not** call `os.open()`, because opening the port would
+assert DTR/RTS and put the chip into download mode:
+
+```python
+def wait_for_device(devnode, timeout=5.0):
+    is_native_usb = devnode and "ttyACM" in devnode
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(devnode):
+            if is_native_usb:
+                return True  # Don't open — avoids DTR reset
+            # ttyUSB: probe with open as before
+            try:
+                fd = os.open(devnode, os.O_RDWR | os.O_NONBLOCK)
+                os.close(fd)
+                return True
+            except OSError:
+                pass
+        time.sleep(0.1)
+    return False
+```
+
+#### 6.5 Hotplug Boot Delay (ttyACM)
+
+When a ttyACM device is hotplugged (USB re-enumeration after reset/flash),
+the portal delays proxy startup by `NATIVE_USB_BOOT_DELAY_S` (2 seconds)
+to allow the chip to boot past the download-mode-sensitive phase before the
+proxy opens the serial port:
+
+```python
+NATIVE_USB_BOOT_DELAY_S = 2
+
+def _bg_start(s=slot, lk=lock, dn=devnode):
+    if dn and "ttyACM" in dn:
+        time.sleep(NATIVE_USB_BOOT_DELAY_S)
+    with lk:
+        # ... start proxy
+```
+
+#### 6.6 Reset Types (Core vs System)
+
+| Reset Type | Mechanism | Re-samples GPIO9? | Result on USB-Serial/JTAG |
+|------------|-----------|-------------------|---------------------------|
+| Core reset | RTS toggle (DTR/RTS sequence) | **No** | Stays in current boot mode |
+| System reset | Watchdog timer (RTC WDT) | **Yes** | Boots based on physical pin state |
+
+**Critical:** After entering download mode, only a **system reset** (watchdog)
+can return the chip to SPI boot mode.  Core reset (RTS toggle) keeps the chip
+in download mode because GPIO9 is not re-sampled.
+
+#### 6.7 Flashing via RFC2217
+
+Flashing works via RFC2217 through `plain_rfc2217_server` for all device
+types.  No SSH to the Pi is needed — esptool's DTR/RTS sequences pass
+through directly.
+
+**ESP32-C3 (native USB, ttyACM):**
+
+```bash
+python3 -m esptool --chip esp32c3 \
+  --port "rfc2217://192.168.0.87:4001" \
+  --before=usb-reset --after=watchdog-reset \
+  write_flash 0x10000 firmware.bin
+```
+
+**Classic ESP32 (UART bridge, ttyUSB):**
+
+```bash
+python3 -m esptool --chip esp32 \
+  --port "rfc2217://192.168.0.87:4001" \
+  --before=default-reset --after=hard-reset \
+  write_flash 0x10000 firmware.bin
+```
+
+**Key esptool flags by device type:**
+
+| Device | `--before` | `--after` |
+|--------|-----------|----------|
+| ESP32-C3 (ttyACM) | `usb-reset` | `watchdog-reset` |
+| ESP32 (ttyUSB) | `default-reset` | `hard-reset` |
+
+**Note:** A harmless RFC2217 parameter negotiation error may appear at the
+end of flashing — the flash and reset still complete successfully.
+
+#### 6.8 RFC2217 Client Best Practices (ttyACM)
+
+When connecting to an ESP32-C3 via RFC2217, the client must prevent DTR
+assertion during connection negotiation:
+
+```python
+ser = serial.serial_for_url('rfc2217://192.168.0.87:4001', do_not_open=True)
+ser.baudrate = 115200
+ser.timeout = 2
+ser.dtr = False   # CRITICAL: prevents download mode
+ser.rts = False   # CRITICAL: prevents reset
+ser.open()
+```
+
+**Never** use `serial.Serial('rfc2217://...')` directly — it opens the port
+immediately and the RFC2217 negotiation may toggle DTR/RTS.
+
+### FR-007 — USB Flap Detection
+
+When a device enters a boot loop (crash → reboot → crash every ~2-3s), the
+Pi sees rapid USB connect/disconnect cycles.  Without protection, the portal
+spawns a new proxy thread for every "add" event, overwhelming the system.
+
+#### 7.1 Detection
+
+```python
+FLAP_WINDOW_S = 30       # Look at events within this window
+FLAP_THRESHOLD = 6       # 6 events in 30s = 3 connect/disconnect cycles
+FLAP_COOLDOWN_S = 30     # Wait 30s of quiet before retrying
+```
+
+Each slot tracks `_event_times[]` — timestamps of recent hotplug events.
+When the count within the window exceeds the threshold, the slot enters
+`flapping=true` state.
+
+#### 7.2 Suppression
+
+While `flapping=true`:
+- Proxy starts are **suppressed** (no new processes spawned)
+- Running proxy is **stopped** (it would die on next disconnect anyway)
+- `last_error` is set to describe the flapping condition
+- `flapping` field is exposed in `/api/devices` JSON
+
+#### 7.3 Recovery
+
+On each new hotplug event, if the gap since the previous event exceeds
+`FLAP_COOLDOWN_S`, the flapping flag is cleared and normal proxy startup
+resumes.
+
+#### 7.4 Web UI
+
+Flapping slots display a red "FLAPPING" status badge and a warning message:
+> Device is boot-looping (rapid USB connect/disconnect). Proxy start suppressed
+> until device stabilises.
+
+Other slots are unaffected and continue operating normally.
 
 ---
 
@@ -363,6 +568,9 @@ The portal serves a single-page HTML UI at `GET /` (port 8080):
 | Unknown slot_key | Portal tracks the slot (present, seq) but does not start a proxy; logged for diagnostics |
 | Hub topology changed | Must re-learn slots and update config |
 | Device not ready | Settle checks with timeout, then fail with `last_error` |
+| ttyACM DTR trap | `wait_for_device()` skips `os.open()` for ttyACM; proxy uses controlled boot sequence (FR-006) |
+| Boot loop (USB flapping) | Flap detection suppresses proxy restarts; clears after cooldown (FR-007) |
+| ESP32-C3 stuck in download mode | Run esptool on Pi with `--after=watchdog-reset` to trigger system reset (FR-006.6) |
 | udev PrivateNetwork blocking curl | udev runs RUN+ handlers in a network-isolated sandbox (`PrivateNetwork=yes`). Direct `curl` to localhost silently fails. Fix: wrap the notify script with `systemd-run --no-block` in the udev rule so it runs outside the sandbox. |
 
 ---
@@ -440,6 +648,8 @@ Add `--run-dut` to include tests that require a WiFi device under test.
 | 2.0 | 2026-02-05 | Claude | Major rewrite: event-driven slot-based architecture |
 | 3.0 | 2026-02-05 | Claude | Portal v3: direct hotplug handling, in-memory seq + locking, systemd-run udev |
 | 4.0 | 2026-02-07 | Claude | WiFi Tester integration: combined Serial + WiFi FSD, two operating modes, appendices for technical details |
+| 5.0 | 2026-02-07 | Claude | ESP32-C3 native USB support: FR-006 (ttyACM handling, plain RFC2217 server, controlled boot sequence, USB reset types, flashing via SSH), FR-007 (USB flap detection), updated edge cases and device settle checks |
+| 5.1 | 2026-02-08 | Claude | plain_rfc2217_server for ALL devices (ttyACM and ttyUSB); esp_rfc2217_server deprecated; flashing via RFC2217 works for both chip types (no SSH needed); updated proxy selection, flashing docs, deliverables |
 
 ---
 
@@ -520,9 +730,12 @@ handler).  It polls the device node before launching the proxy:
 ```python
 def wait_for_device(devnode, timeout=5.0):
     """Wait for device to be usable (called inside portal)."""
+    is_native_usb = devnode and "ttyACM" in devnode
     deadline = time.time() + timeout
     while time.time() < deadline:
         if os.path.exists(devnode):
+            if is_native_usb:
+                return True  # Don't open — avoids DTR reset (see FR-006)
             try:
                 fd = os.open(devnode, os.O_RDWR | os.O_NONBLOCK)
                 os.close(fd)
@@ -532,6 +745,13 @@ def wait_for_device(devnode, timeout=5.0):
         time.sleep(0.1)
     return False
 ```
+
+**ttyACM devices:** Only checks file existence — `os.open()` is skipped
+because the Linux `cdc_acm` driver asserts DTR+RTS on open, which puts
+ESP32-C3 native USB devices into download mode (see FR-006.4).
+
+**ttyUSB devices:** Probes with `os.open()` as before — UART bridge chips
+are not affected by DTR on open.
 
 If the device does not settle within the timeout, the slot's `last_error` is
 set and the proxy is not started.
@@ -669,6 +889,15 @@ Add this to /etc/rfc2217/slots.json:
 - [ ] TASK-011: Test all test cases
 - [ ] TASK-012: Deploy to Serial Pi (192.168.0.87)
 
+**Native USB (ESP32-C3):**
+- [x] TASK-030: Create plain_rfc2217_server.py for ttyACM devices
+- [x] TASK-031: Auto-detect ttyACM vs ttyUSB and select proxy server
+- [x] TASK-032: Controlled boot sequence in plain_rfc2217_server.py
+- [x] TASK-033: Skip os.open() in wait_for_device() for ttyACM
+- [x] TASK-034: Add NATIVE_USB_BOOT_DELAY_S hotplug delay for ttyACM
+- [x] TASK-035: USB flap detection (FLAP_WINDOW/THRESHOLD/COOLDOWN)
+- [x] TASK-036: Flap detection UI (red FLAPPING badge + warning)
+
 **WiFi:**
 - [x] TASK-020: Implement wifi_controller.py (AP, STA, scan, relay, events)
 - [x] TASK-021: Add WiFi API routes to portal.py
@@ -684,7 +913,8 @@ Add this to /etc/rfc2217/slots.json:
 |-------------|-------------|
 | `portal.py` | HTTP server with serial slot management, WiFi API, process supervision, hotplug handling |
 | `wifi_controller.py` | WiFi instrument backend (hostapd, dnsmasq, wpa_supplicant, iw, HTTP relay) |
-| `esp_rfc2217_server.py` | RFC2217 server from esptool (preferred — stable, supports flashing) |
+| `plain_rfc2217_server.py` | RFC2217 server with direct DTR/RTS passthrough (all devices) |
+| `esp_rfc2217_server.py` | RFC2217 server from esptool (deprecated — kept as fallback) |
 | `serial_proxy.py` | RFC2217 proxy with serial traffic logging (fallback) |
 | `rfc2217-udev-notify.sh` | Posts udev events to portal API via curl |
 | `wifi-lease-notify.sh` | Posts dnsmasq DHCP lease events to portal API |

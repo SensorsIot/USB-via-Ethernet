@@ -36,6 +36,11 @@ FLAP_WINDOW_S = 30       # Look at events within this window
 FLAP_THRESHOLD = 6        # 6 events in 30s = 3 connect/disconnect cycles
 FLAP_COOLDOWN_S = 30      # After flapping, wait 30s of quiet before retry
 
+# Native USB (ttyACM) boot delay — let ESP32-C3 boot past download-mode window
+# before opening the port (Linux cdc_acm asserts DTR+RTS on open, which triggers
+# the USB-Serial/JTAG controller's auto-download if the chip is still in early boot)
+NATIVE_USB_BOOT_DELAY_S = 2
+
 # Module-level state
 slots: dict[str, dict] = {}
 seq_counter: int = 0
@@ -118,10 +123,18 @@ def _find_proxy_exe() -> str | None:
 
 
 def wait_for_device(devnode: str, timeout: float = 5.0) -> bool:
-    """Poll os.open() until the device node is ready."""
+    """Wait until the device node exists and is accessible.
+
+    For ttyACM (native USB CDC) devices, only check file existence —
+    os.open() asserts DTR+RTS via the cdc_acm driver, which resets
+    ESP32-C3 into download mode during the boot window.
+    """
+    is_native_usb = devnode and "ttyACM" in devnode
     deadline = time.time() + timeout
     while time.time() < deadline:
         if os.path.exists(devnode):
+            if is_native_usb:
+                return True  # Don't open — avoids DTR reset
             try:
                 fd = os.open(devnode, os.O_RDWR | os.O_NONBLOCK)
                 os.close(fd)
@@ -524,7 +537,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif configured:
                 # Start proxy in a background thread so we don't block the
                 # HTTP response for the settle + port-listen check.
-                def _bg_start(s=slot, lk=lock):
+                def _bg_start(s=slot, lk=lock, dn=devnode):
+                    # Native USB (ttyACM): delay before opening port so the
+                    # chip boots past the download-mode-sensitive phase.
+                    if dn and "ttyACM" in dn:
+                        time.sleep(NATIVE_USB_BOOT_DELAY_S)
                     with lk:
                         if s["flapping"]:
                             return  # Flapping detected while queued
