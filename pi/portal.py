@@ -3,7 +3,7 @@
 RFC2217 Portal v3 — Proxy Supervisor
 
 HTTP server that tracks USB serial device hotplug events and manages
-serial_proxy.py lifecycle.  On hotplug add → start proxy; on remove → stop it.
+plain_rfc2217_server.py lifecycle.  On hotplug add → start proxy; on remove → stop it.
 Slot configuration is loaded from slots.json.
 """
 
@@ -23,13 +23,7 @@ import wifi_controller
 
 PORT = 8080
 CONFIG_FILE = os.environ.get("RFC2217_CONFIG", "/etc/rfc2217/slots.json")
-PROXY_PATHS = [
-    "/usr/local/bin/esp_rfc2217_server.py",
-    "/usr/local/bin/serial_proxy.py",
-    "/usr/local/bin/serial-proxy",
-]
-PLAIN_RFC2217_PATH = "/usr/local/bin/plain_rfc2217_server.py"
-LOG_DIR = "/var/log/serial"
+PROXY_EXE = "/usr/local/bin/plain_rfc2217_server.py"
 
 # Flap detection — suppress proxy restarts during USB connect/disconnect storms
 FLAP_WINDOW_S = 30       # Look at events within this window
@@ -115,13 +109,6 @@ def get_hostname() -> str:
     return socket.gethostname()
 
 
-def _find_proxy_exe() -> str | None:
-    for p in PROXY_PATHS:
-        if os.path.exists(p):
-            return p
-    return None
-
-
 def wait_for_device(devnode: str, timeout: float = 5.0) -> bool:
     """Wait until the device node exists and is accessible.
 
@@ -166,21 +153,13 @@ def _is_process_alive(pid: int) -> bool:
 
 
 def start_proxy(slot: dict) -> bool:
-    """Start serial_proxy for *slot*.  Returns True on success."""
+    """Start plain_rfc2217_server for *slot*.  Returns True on success."""
     devnode = slot["devnode"]
     tcp_port = slot["tcp_port"]
     label = slot["label"]
 
-    # Use plain RFC2217 for native USB CDC (ttyACM) devices like ESP32-C3.
-    # esp_rfc2217_server intercepts DTR/RTS which breaks C3 bootloader entry.
-    is_native_usb = devnode and "ttyACM" in devnode
-    if is_native_usb and os.path.exists(PLAIN_RFC2217_PATH):
-        proxy_exe = PLAIN_RFC2217_PATH
-        print(f"[portal] {label}: using plain RFC2217 (native USB CDC)", flush=True)
-    else:
-        proxy_exe = _find_proxy_exe()
-    if not proxy_exe:
-        slot["last_error"] = "No serial proxy executable found"
+    if not os.path.exists(PROXY_EXE):
+        slot["last_error"] = f"Proxy executable not found: {PROXY_EXE}"
         print(f"[portal] {label}: {slot['last_error']}", flush=True)
         return False
 
@@ -190,10 +169,7 @@ def start_proxy(slot: dict) -> bool:
         print(f"[portal] {label}: {slot['last_error']}", flush=True)
         return False
 
-    cmd = ["python3", proxy_exe, "-p", str(tcp_port)]
-    if "serial_proxy" in proxy_exe:
-        cmd.extend(["-l", LOG_DIR])
-    cmd.append(devnode)
+    cmd = ["python3", PROXY_EXE, "-p", str(tcp_port), devnode]
 
     try:
         proc = subprocess.Popen(
@@ -1065,8 +1041,6 @@ def main():
     for slot in slots.values():
         if slot["tcp_port"]:
             slot["url"] = f"rfc2217://{host_ip}:{slot['tcp_port']}"
-
-    os.makedirs(LOG_DIR, exist_ok=True)
 
     # Scan for devices already plugged in at boot
     scan_existing_devices()
