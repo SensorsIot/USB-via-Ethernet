@@ -80,8 +80,8 @@ Mode is switched via `POST /api/wifi/mode` or the web UI toggle.
 | portal.py (rfc2217-portal) | /usr/local/bin/rfc2217-portal | Web UI, HTTP API, proxy supervisor, hotplug handler, WiFi API |
 | wifi_controller.py | /usr/local/bin/wifi_controller.py | WiFi instrument backend (AP, STA, scan, relay, events) |
 | plain_rfc2217_server.py | /usr/local/bin/plain_rfc2217_server.py | RFC2217 server with direct DTR/RTS passthrough (all devices) |
-| esp_rfc2217_server.py | /usr/local/bin/esp_rfc2217_server.py | RFC2217 server from esptool (deprecated — breaks C3 native USB, not needed for ttyUSB) |
-| serial_proxy.py | /usr/local/bin/serial_proxy.py | RFC2217 server with logging (fallback) |
+| ~~esp_rfc2217_server.py~~ | removed | Deprecated — breaks C3 native USB and classic ESP32 over RFC2217 |
+| ~~serial_proxy.py~~ | removed | Deprecated — replaced by plain_rfc2217_server.py |
 | rfc2217-udev-notify.sh | /usr/local/bin/rfc2217-udev-notify.sh | Posts udev events to portal API |
 | wifi-lease-notify.sh | /usr/local/bin/wifi-lease-notify.sh | Posts dnsmasq DHCP lease events to portal API |
 | rfc2217-learn-slots | /usr/local/bin/rfc2217-learn-slots | Slot configuration helper |
@@ -134,8 +134,17 @@ or VID/PID (not unique).
 1. udev emits `remove` event
 2–4. Same notification path as plug
 5. Portal increments `seq_counter`, records metadata
-6. Portal stops the proxy process for that slot (idempotent)
+6. Portal stops the proxy process in a **background thread** (non-blocking,
+   so the single-threaded HTTP server can immediately process the subsequent
+   `add` event from USB re-enumeration)
 7. Slot state becomes `running=false`, `present=false`
+
+**USB re-enumeration (esptool reset/flash):**
+When esptool performs a watchdog reset or flash operation, the ESP32-C3's
+USB-Serial/JTAG controller disconnects and reconnects.  This triggers a
+`remove` → `add` hotplug sequence.  The portal handles this automatically:
+the proxy is stopped on `remove` and restarted on `add` (with the 2s
+ttyACM boot delay).  No manual intervention is required.
 
 **Boot scan:** On startup, portal scans `/dev/ttyACM*` and `/dev/ttyUSB*`,
 queries `udevadm info` for each, and starts proxies for any device matching a
@@ -201,9 +210,9 @@ Configuration file: `/etc/rfc2217/slots.json`
 
 ### FR-004 — Serial Traffic Logging
 
-- All serial traffic logged with timestamps to `/var/log/serial/`
-- Log format: `[timestamp] [direction] data`
-- Only active when using `serial_proxy.py` (fallback proxy)
+- Removed.  `serial_proxy.py` (which provided traffic logging) has been
+  deprecated in favour of `plain_rfc2217_server.py`.
+- Serial traffic is observable via RFC2217 clients (e.g. pyserial).
 
 ### FR-005 — Web Portal (Serial Section)
 
@@ -650,6 +659,7 @@ Add `--run-dut` to include tests that require a WiFi device under test.
 | 4.0 | 2026-02-07 | Claude | WiFi Tester integration: combined Serial + WiFi FSD, two operating modes, appendices for technical details |
 | 5.0 | 2026-02-07 | Claude | ESP32-C3 native USB support: FR-006 (ttyACM handling, plain RFC2217 server, controlled boot sequence, USB reset types, flashing via SSH), FR-007 (USB flap detection), updated edge cases and device settle checks |
 | 5.1 | 2026-02-08 | Claude | plain_rfc2217_server for ALL devices (ttyACM and ttyUSB); esp_rfc2217_server deprecated; flashing via RFC2217 works for both chip types (no SSH needed); updated proxy selection, flashing docs, deliverables |
+| 5.2 | 2026-02-08 | Claude | Removed esp_rfc2217_server.py and serial_proxy.py (no longer installed); proxy auto-restart after esptool USB re-enumeration (background stop_proxy, BrokenPipeError fix, curl timeout 10s); FR-004 logging removed; updated deliverables |
 
 ---
 
@@ -776,7 +786,7 @@ The udev notify script posts a JSON payload to the portal:
 # /usr/local/bin/rfc2217-udev-notify.sh
 # Args: ACTION DEVNAME ID_PATH DEVPATH
 
-curl -m 2 -s -X POST http://127.0.0.1:8080/api/hotplug \
+curl -m 10 -s -X POST http://127.0.0.1:8080/api/hotplug \
   -H 'Content-Type: application/json' \
   -d "{\"action\":\"$1\",\"devnode\":\"$2\",\"id_path\":\"${3:-}\",\"devpath\":\"$4\"}" \
   || true
@@ -914,8 +924,8 @@ Add this to /etc/rfc2217/slots.json:
 | `portal.py` | HTTP server with serial slot management, WiFi API, process supervision, hotplug handling |
 | `wifi_controller.py` | WiFi instrument backend (hostapd, dnsmasq, wpa_supplicant, iw, HTTP relay) |
 | `plain_rfc2217_server.py` | RFC2217 server with direct DTR/RTS passthrough (all devices) |
-| `esp_rfc2217_server.py` | RFC2217 server from esptool (deprecated — kept as fallback) |
-| `serial_proxy.py` | RFC2217 proxy with serial traffic logging (fallback) |
+| ~~`esp_rfc2217_server.py`~~ | Removed — breaks C3 native USB and classic ESP32 over RFC2217 |
+| ~~`serial_proxy.py`~~ | Removed — replaced by plain_rfc2217_server.py |
 | `rfc2217-udev-notify.sh` | Posts udev events to portal API via curl |
 | `wifi-lease-notify.sh` | Posts dnsmasq DHCP lease events to portal API |
 | `rfc2217-learn-slots` | CLI tool to discover slot_key for physical connectors |
